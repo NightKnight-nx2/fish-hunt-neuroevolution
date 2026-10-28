@@ -2,11 +2,9 @@
 
 A single-file (`index.html`), browser-only, humorous/educational **neuroevolution** simulation. A predator fish controlled by a tiny neural network learns to hunt prey fish through a **genetic algorithm** — with zero human intervention. The scene narrates the predator's evolution from "clueless and aimless" to "apex predator" as a time-lapse, framed with a tongue-in-cheek "Level 1/6 · blind" style narrative.
 
-> This project is an experiment in the short-video, algorithm/AI-explainer format inspired by the Instagram account [**@reelgorithm.py**](https://www.instagram.com/reelgorithm.py). The format idea comes from there; the code and content in this repository are original.
-
 ## Live demo
 
-Just open `index.html` directly in a browser — no build step, no dependency install.
+https://nightknight-nx2.github.io/fish-hunt-neuroevolution/
 
 - **Simplest:** double-click the file / drag it into your browser.
 - **Recommended** (some browsers restrict Web Workers over `file://`): serve it locally:
