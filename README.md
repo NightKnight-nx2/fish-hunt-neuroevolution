@@ -2,11 +2,9 @@
 
 Tek dosyalık (`index.html`), tarayıcıda çalışan, mizahi/eğitici bir **nöroevrim** simülasyonu. Küçük bir sinir ağıyla kontrol edilen bir avcı balık, yem balıklarını avlamayı **genetik algoritma** ile — hiçbir insan müdahalesi olmadan — öğreniyor. Sahne, "Level 1/6 · blind" gibi mizahi bir anlatımla, avcının "kör ve amaçsız"dan "apex" (zirve avcı) seviyesine evrilişini bir zaman çizelgesi (time-lapse) olarak gösteriyor.
 
-> Bu proje, Instagram'daki [**@reelgorithm.py**](https://www.instagram.com/reelgorithm.py) hesabından esinlenen, kısa-video formatında algoritma/yapay-zeka anlatımı denemesidir. Format fikri oradan alınmıştır; kod ve içerik bu depoya özgüdür.
-
 ## Canlı demo
 
-`index.html`'i doğrudan bir tarayıcıda açmanız yeterli — harici bir derleme adımı veya bağımlılık kurulumu yok.
+https://nightknight-nx2.github.io/fish-hunt-neuroevolution/
 
 - **En basit yol:** Dosyaya çift tıklayın / tarayıcıya sürükleyin.
 - **Önerilen yol (Web Worker'ın bazı tarayıcılarda `file://` üzerinden kısıtlanmasına karşı):** basit bir yerel sunucu ile açın:
