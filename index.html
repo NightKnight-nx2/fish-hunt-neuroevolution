@@ -1,0 +1,614 @@
+<!DOCTYPE html>
+<!--
+  FISH HUNT · neuroevolution demo (p5.js, tek dosya)
+  Tuslar:  SPACE = bastan baslat   R = 9:16 <-> 1:1   F = tam ekran
+  URL:     ?ratio=1x1   ?seed=7   ?gens=60
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>fish hunt · neuroevolution</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; }
+  body { display: flex; align-items: center; justify-content: center; cursor: none; }
+  canvas { display: block; }
+</style>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+</head>
+<body>
+
+<!-- ================================================================
+     CORE: simulasyon + sinir agi + genetik algoritma.
+     Hem ana thread (gosterim) hem Web Worker (arka plan egitimi)
+     bu ayni kodu kullanir.
+     ================================================================ -->
+<script type="text/plain" id="core">
+const Core = (function () {
+  'use strict';
+  const PI = Math.PI, TAU = PI * 2;
+
+  function mulberry32(a) {
+    return function () {
+      a |= 0; a = (a + 0x6D2B79F5) | 0;
+      let t = Math.imul(a ^ (a >>> 15), 1 | a);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+  function gauss(r) {
+    let u = 0, v = 0;
+    while (u === 0) u = r();
+    while (v === 0) v = r();
+    return Math.sqrt(-2 * Math.log(u)) * Math.cos(TAU * v);
+  }
+
+  const DEFAULTS = {
+    W: 540, H: 960, nPrey: 9,
+    K: 3,            // kac yem "gorulur" (en yakin K)
+    nHid: 8,         // gizli katman
+    sense: 340,      // gorus mesafesi (px)
+    eatDist: 16,
+    vMax: 2.4, turnMax: 0.12, preyV: 0.85,
+    drain: 0.0018, moveCost: 0.0018, eatGain: 0.45,   // enerji
+    maxTicks: 1200,  // 60 tick/sn -> 20 sn
+    // genetik algoritma
+    pop: 50, episodes: 2, elite: 3, tourn: 4, immigrants: 3,
+    mutRate: 0.07, mutSigma: 0.22, initSigma: 0.45,
+    seed: 7
+  };
+
+  // genom: [her gizli noron: bias + nIn agirlik] ... [her cikis: bias + nHid agirlik]
+  function genomeSize(c) { const nIn = 2 * c.K; return (nIn + 1) * c.nHid + (c.nHid + 1) * 2; }
+
+  class Sim {
+    constructor(c, genome, seed) {
+      this.c = c; this.g = genome;
+      this.rng = mulberry32(seed);
+      const n = c.nPrey; this.n = n;
+      this.px = new Float64Array(n); this.py = new Float64Array(n);
+      this.pa = new Float64Array(n); this.pv = new Float64Array(n);
+      this.nIn = 2 * c.K;
+      this.inp = new Float64Array(this.nIn);
+      this.hid = new Float64Array(c.nHid);
+      this.out = new Float64Array(2);
+      this.bd = new Float64Array(c.K); this.bi = new Int32Array(c.K).fill(-1);
+      this.hx = this.rng() * c.W; this.hy = this.rng() * c.H; this.ha = this.rng() * TAU;
+      this.speed = 0; this.energy = 1; this.eaten = 0; this.ticks = 0;
+      this.dead = false; this.done = false;
+      this.events = null;             // gosterimde yeme olaylari (x,y,x,y..)
+      for (let i = 0; i < n; i++) { this.pv[i] = 0.6 + 0.8 * this.rng(); this.place(i); }
+    }
+    place(i) {
+      const c = this.c; let x = 0, y = 0;
+      for (let t = 0; t < 12; t++) {
+        x = this.rng() * c.W; y = this.rng() * c.H;
+        let dx = Math.abs(x - this.hx), dy = Math.abs(y - this.hy);
+        if (dx > c.W / 2) dx = c.W - dx;
+        if (dy > c.H / 2) dy = c.H - dy;
+        if (dx * dx + dy * dy > 22500) break;
+      }
+      this.px[i] = x; this.py[i] = y; this.pa[i] = this.rng() * TAU;
+    }
+    step() {
+      if (this.dead || this.done) return;
+      const c = this.c, W = c.W, H = c.H, hW = W / 2, hH = H / 2, K = c.K, n = this.n;
+      const px = this.px, py = this.py, bd = this.bd, bi = this.bi, inp = this.inp;
+      const hx = this.hx, hy = this.hy;
+
+      // ---- algi: en yakin K yem ----
+      for (let k = 0; k < K; k++) { bd[k] = 1e18; bi[k] = -1; }
+      for (let i = 0; i < n; i++) {
+        let dx = px[i] - hx, dy = py[i] - hy;
+        if (dx > hW) dx -= W; else if (dx < -hW) dx += W;
+        if (dy > hH) dy -= H; else if (dy < -hH) dy += H;
+        const d2 = dx * dx + dy * dy;
+        if (d2 < bd[K - 1]) {
+          let k = K - 1;
+          while (k > 0 && bd[k - 1] > d2) { bd[k] = bd[k - 1]; bi[k] = bi[k - 1]; k--; }
+          bd[k] = d2; bi[k] = i;
+        }
+      }
+      for (let k = 0; k < K; k++) {
+        const i = bi[k];
+        let dx = px[i] - hx, dy = py[i] - hy;
+        if (dx > hW) dx -= W; else if (dx < -hW) dx += W;
+        if (dy > hH) dy -= H; else if (dy < -hH) dy += H;
+        let a = Math.atan2(dy, dx) - this.ha;
+        a -= TAU * Math.floor((a + PI) / TAU);            // [-PI, PI)
+        inp[2 * k] = a / PI;                                // goreli aci
+        inp[2 * k + 1] = 1 - Math.min(1, Math.sqrt(bd[k]) / c.sense); // yakinlik
+      }
+
+      // ---- beyin: nIn -> nHid (tanh) -> 2 (tanh) ----
+      const g = this.g, nIn = this.nIn, nH = c.nHid, hid = this.hid, out = this.out;
+      let p = 0;
+      for (let h = 0; h < nH; h++) {
+        let s = g[p++];
+        for (let i = 0; i < nIn; i++) s += g[p++] * inp[i];
+        hid[h] = Math.tanh(s);
+      }
+      for (let o = 0; o < 2; o++) {
+        let s = g[p++];
+        for (let h = 0; h < nH; h++) s += g[p++] * hid[h];
+        out[o] = Math.tanh(s);
+      }
+
+      // ---- avci hareketi: cikis0 = donus, cikis1 = hiz ----
+      this.ha += out[0] * c.turnMax;
+      const speed = (out[1] + 1) * 0.5 * c.vMax;
+      this.speed = speed;
+      let nx = hx + Math.cos(this.ha) * speed, ny = hy + Math.sin(this.ha) * speed;
+      if (nx < 0) nx += W; else if (nx >= W) nx -= W;
+      if (ny < 0) ny += H; else if (ny >= H) ny -= H;
+      this.hx = nx; this.hy = ny;
+
+      // ---- yemler: rastgele gezinme ----
+      const pa = this.pa, pv = this.pv, rng = this.rng;
+      for (let i = 0; i < n; i++) {
+        pa[i] += (rng() - 0.5) * 0.4;
+        const v = c.preyV * pv[i];
+        let x = px[i] + Math.cos(pa[i]) * v, y = py[i] + Math.sin(pa[i]) * v;
+        if (x < 0) x += W; else if (x >= W) x -= W;
+        if (y < 0) y += H; else if (y >= H) y -= H;
+        px[i] = x; py[i] = y;
+      }
+
+      // ---- enerji + yeme ----
+      this.energy -= c.drain + c.moveCost * (speed / c.vMax);
+      const ed2 = c.eatDist * c.eatDist;
+      for (let i = 0; i < n; i++) {
+        let dx = px[i] - nx, dy = py[i] - ny;
+        if (dx > hW) dx -= W; else if (dx < -hW) dx += W;
+        if (dy > hH) dy -= H; else if (dy < -hH) dy += H;
+        if (dx * dx + dy * dy < ed2) {
+          this.eaten++;
+          this.energy = Math.min(1, this.energy + c.eatGain);
+          if (this.events) this.events.push(px[i], py[i]);
+          this.place(i);
+        }
+      }
+      this.ticks++;
+      if (this.energy <= 0) this.dead = true;
+      else if (this.ticks >= c.maxTicks) this.done = true;
+    }
+    fitness() { return this.eaten * 10 + this.ticks / 60; }   // yenen yem + hayatta kalma (sn)
+  }
+
+  function makeTrainer(cfg) {
+    const rng = mulberry32(cfg.seed * 7919 + 13);
+    const size = genomeSize(cfg), nIn = 2 * cfg.K, nH = cfg.nHid;
+    let pop = [];
+    for (let i = 0; i < cfg.pop; i++) {
+      const g = new Float32Array(size);
+      for (let j = 0; j < size; j++) g[j] = gauss(rng) * cfg.initSigma;
+      pop.push(g);
+    }
+    let gen = 0;
+
+    function evaluate(g, seeds) {
+      let f = 0, e = 0;
+      for (let s = 0; s < seeds.length; s++) {
+        const sim = new Sim(cfg, g, seeds[s]);
+        while (!sim.dead && !sim.done) sim.step();
+        f += sim.fitness(); e += sim.eaten;
+      }
+      return [f / seeds.length, e / seeds.length];
+    }
+
+    // noron-bazli crossover: gizli noronun giris agirliklari + cikis agirliklari ayni ebeveynden
+    function crossover(a, b) {
+      const c = new Float32Array(size), base = nH * (nIn + 1);
+      for (let h = 0; h < nH; h++) {
+        const src = rng() < 0.5 ? a : b;
+        for (let i = 0; i <= nIn; i++) c[h * (nIn + 1) + i] = src[h * (nIn + 1) + i];
+        for (let o = 0; o < 2; o++) c[base + o * (nH + 1) + 1 + h] = src[base + o * (nH + 1) + 1 + h];
+      }
+      for (let o = 0; o < 2; o++) c[base + o * (nH + 1)] = (rng() < 0.5 ? a : b)[base + o * (nH + 1)];
+      return c;
+    }
+
+    function runGeneration() {
+      const seeds = [];
+      for (let k = 0; k < cfg.episodes; k++) seeds.push((rng() * 2147483647) | 0);
+      const n = pop.length, fit = new Float64Array(n), eat = new Float64Array(n);
+      let sum = 0;
+      for (let i = 0; i < n; i++) { const r = evaluate(pop[i], seeds); fit[i] = r[0]; eat[i] = r[1]; sum += r[0]; }
+      const idx = Array.from({ length: n }, (_, i) => i).sort((x, y) => fit[y] - fit[x]);
+      const res = {
+        gen, best: fit[idx[0]], avg: sum / n, eaten: eat[idx[0]],
+        champion: Float32Array.from(pop[idx[0]]),
+        weak: Float32Array.from(pop[idx[Math.floor(n * 0.85)]])
+      };
+      const pick = () => {
+        let b = -1;
+        for (let t = 0; t < cfg.tourn; t++) { const c = (rng() * n) | 0; if (b < 0 || fit[c] > fit[b]) b = c; }
+        return pop[b];
+      };
+      const next = [];
+      for (let e = 0; e < cfg.elite; e++) next.push(Float32Array.from(pop[idx[e]]));
+      while (next.length < n) {
+        const child = crossover(pick(), pick());
+        for (let j = 0; j < size; j++) if (rng() < cfg.mutRate) child[j] += gauss(rng) * cfg.mutSigma;
+        next.push(child);
+      }
+      // gocmenler: her nesle birkac rastgele birey (yerel optimumdan kacis)
+      for (let m = 0; m < cfg.immigrants; m++) {
+        const g = new Float32Array(size);
+        for (let j = 0; j < size; j++) g[j] = gauss(rng) * cfg.initSigma;
+        next[next.length - 1 - m] = g;
+      }
+      pop = next;
+      // ilerleme yoksa (yerel optimum) populasyonu bastan baslat
+      if ((gen === 16 || gen === 30) && res.best < 45) {
+        for (let i = 0; i < n; i++) for (let j = 0; j < size; j++) pop[i][j] = gauss(rng) * cfg.initSigma;
+      }
+      gen++;
+      return res;
+    }
+    return { runGeneration, get gen() { return gen; } };
+  }
+
+  return { DEFAULTS, genomeSize, Sim, makeTrainer, mulberry32 };
+})();
+</script>
+
+<!-- ================================================================
+     SAHNE: p5.js gosterim + zaman cizelgesi
+     ================================================================ -->
+<script>
+const coreText = document.getElementById('core').textContent;
+const Core = new Function(coreText + '\nreturn Core;')();
+
+const QS = new URLSearchParams(location.search);
+const SQUARE = /^(1x1|1:1|square)$/.test(QS.get('ratio') || '');
+const W = SQUARE ? 640 : 540, H = SQUARE ? 640 : 960;      // 9:16 (varsayilan) ya da 1:1
+const U = SQUARE ? 0.92 : 1;                                // arayuz olcegi
+const MAXGEN = +(QS.get('gens') || 60);
+const CFG = Object.assign({}, Core.DEFAULTS, {
+  W, H, nPrey: Math.round(W * H / 57600), seed: +(QS.get('seed') || 7)
+});
+
+// ---------- seviyeler ----------
+// thr: o seviyeye gecmek icin gereken en iyi fitness (egitim sirasinda ilk asildigi nesil secilir)
+const LV = [
+  { name: 'blind',     sub: "it's totally empty, no",                 dur: 6.0,  clarity: 0.10, thr: 0   },
+  { name: 'twitchy',   sub: 'something moved in there. probably.',    dur: 4.4,  clarity: 0.30, thr: 40  },
+  { name: 'curious',   sub: 'wait. is it looking at the fish?',       dur: 4.4,  clarity: 0.50, thr: 80  },
+  { name: 'hungry',    sub: "okay now it's personal",                 dur: 4.4,  clarity: 0.70, thr: 115 },
+  { name: 'locked on', sub: 'fewer circles. way fewer circles.',      dur: 4.6,  clarity: 0.85, thr: 150 },
+  { name: 'apex',      sub: "it's totally full, yes",                 dur: 11.5, clarity: 1.00, thr: 0   }
+];
+const DEATH = ['and it starved. as predicted.', 'starved. progress is slow.', 'starved. so close.', 'starved. ouch.', 'starved?! rude.', 'starved. what.'];
+const MONT_MS = 2300, TRAIL_MAX = 70;
+
+// ---------- arka plan egitimi (Web Worker, olmazsa ana thread) ----------
+const hist = [];                 // hist[g] = {gen,best,avg,eaten,champion,weak}
+let latest = -1, trainDone = false, fallbackOn = false;
+function onResult(r) { hist[r.gen] = r; if (r.gen > latest) latest = r.gen; if (r.gen >= MAXGEN) trainDone = true; }
+function fallbackTraining() {
+  if (fallbackOn) return; fallbackOn = true;
+  const T = Core.makeTrainer(CFG);
+  (function loop() { const r = T.runGeneration(); onResult(r); if (r.gen < MAXGEN) setTimeout(loop, 12); })();
+}
+function startTraining() {
+  try {
+    const src = coreText + '\n' +
+      'let T=null;onmessage=function(e){T=Core.makeTrainer(e.data.cfg);const mg=e.data.maxGen;' +
+      '(function loop(){const r=T.runGeneration();postMessage(r);if(r.gen<mg)setTimeout(loop,0);})();};';
+    const w = new Worker(URL.createObjectURL(new Blob([src], { type: 'text/javascript' })));
+    w.onmessage = e => onResult(e.data);
+    w.onerror = () => { w.terminate(); fallbackTraining(); };
+    w.postMessage({ cfg: CFG, maxGen: MAXGEN });
+  } catch (err) { fallbackTraining(); }
+}
+startTraining();
+
+// ---------- durum ----------
+let sim = null, phase = 'boot', L = 0, tPhase = 0, lastMs = 0, dtMs = 16, accTicks = 0;
+let levelGen = [0, -1, -1, -1, -1, -1];
+let trail = [], rings = [], flash = 0, attempt = 0, endedAt = 0, ahaDone = false;
+let mFrom = 0, mNext = 1, mShown = -1, seedCounter = 0;
+
+function newSim(genome, seed) {
+  sim = new Core.Sim(CFG, genome, seed); sim.events = [];
+  trail = []; endedAt = 0; accTicks = 0;
+}
+function levelGenome(l) { return l === 0 ? hist[0].weak : hist[levelGen[l]].champion; }
+function beginLevel(l) {
+  L = l; phase = 'level'; tPhase = millis(); attempt = 0; rings = [];
+  newSim(levelGenome(l), 100 + l * 31);
+}
+function restartTimeline() {
+  levelGen = [0, -1, -1, -1, -1, -1]; flash = 0; ahaDone = false; seedCounter = 0;
+  beginLevel(0);
+}
+function targetGen(l) {
+  const start = levelGen[l - 1] + 1;
+  if (l === 5) {                                   // son sahne: egitim bitince son nesillerin en iyisi
+    if (!trainDone) return -1;
+    let bg = Math.max(start, latest - 8);
+    for (let g = bg; g <= latest; g++) if (hist[g].best > hist[bg].best) bg = g;
+    return bg;
+  }
+  for (let g = start; g <= latest; g++) if (hist[g].best >= LV[l].thr) return g;
+  if (trainDone) return Math.min(latest, start);
+  return -1;
+}
+function startMontage(nl) { phase = 'montage'; mNext = nl; mFrom = levelGen[nl - 1]; tPhase = millis(); mShown = -1; }
+
+// ---------- p5 ----------
+function setup() {
+  pixelDensity(2);
+  createCanvas(W, H);
+  frameRate(60);
+  textFont('monospace');
+  fit();
+}
+function fit() {
+  const s = Math.min(innerWidth / W, innerHeight / H), cv = document.querySelector('canvas');
+  if (cv) { cv.style.width = (W * s) + 'px'; cv.style.height = (H * s) + 'px'; }
+}
+function windowResized() { fit(); }
+function keyPressed() {
+  if (key === ' ') { if (hist[0]) restartTimeline(); }
+  else if (key === 'r' || key === 'R') { location.search = SQUARE ? '' : '?ratio=1x1'; }
+  else if (key === 'f' || key === 'F') { fullscreen(!fullscreen()); }
+  return false;
+}
+
+function stepSim(ticksF, now) {
+  accTicks += ticksF;
+  let guard = 0;
+  while (accTicks >= 1 && guard++ < 40) {
+    accTicks -= 1;
+    sim.step();
+    trail.push(sim.hx, sim.hy);
+    if (trail.length > TRAIL_MAX * 2) trail.splice(0, 2);
+    const ev = sim.events;
+    for (let i = 0; i < ev.length; i += 2) rings.push({ x: ev[i], y: ev[i + 1], t: now });
+    ev.length = 0;
+  }
+  if (accTicks > 1) accTicks = 0;
+}
+function respawnIfOver(now) {
+  if (sim.dead || sim.done) {
+    if (!endedAt) endedAt = now;
+    else if (now - endedAt > 1100) { attempt++; newSim(levelGenome(L), 100 + L * 31 + attempt * 7); }
+  }
+}
+
+function draw() {
+  const now = millis();
+  dtMs = Math.min(50, now - lastMs); lastMs = now;
+  if (phase === 'boot') {
+    if (hist[0]) restartTimeline();
+    else { background(0); fill(255, 90); noStroke(); textAlign(CENTER, CENTER); textSize(14 * U); text('waking up a tiny brain...', W / 2, H / 2); return; }
+  }
+  const tpf = dtMs / 16.667;
+  const el = (now - tPhase) / 1000;
+
+  if (phase === 'level') {
+    stepSim(tpf, now); respawnIfOver(now);
+    if (L === 5 && !ahaDone && el > 2.6) { ahaDone = true; flash = 0.55; }
+    if (el >= LV[L].dur) { if (L < 5) startMontage(L + 1); else { phase = 'end'; tPhase = now; } }
+  } else if (phase === 'end') {
+    stepSim(tpf, now); respawnIfOver(now);
+    if (el > 5.0) restartTimeline();
+  } else if (phase === 'montage') {
+    let tg = levelGen[mNext] >= 0 ? levelGen[mNext] : targetGen(mNext);
+    if (tg >= 0) levelGen[mNext] = tg;
+    const endG = tg >= 0 ? tg : latest;
+    const p = Math.min(1, el * 1000 / MONT_MS);
+    const e = p < 0.5 ? 2 * p * p : 1 - Math.pow(-2 * p + 2, 2) / 2;
+    const shown = Math.max(mFrom, Math.min(latest, Math.round(mFrom + (endG - mFrom) * e)));
+    if (shown !== mShown || sim.dead || sim.done) {
+      mShown = shown; newSim(hist[shown].champion, 7000 + (seedCounter++)); flash = Math.max(flash, 0.3);
+    }
+    stepSim(tpf * 6, now);
+    if (p >= 1 && tg >= 0) beginLevel(mNext);
+  }
+  render(now, el);
+}
+
+// ---------- cizim ----------
+const OFF_X = [-W, 0, W], OFF_Y = [-H, 0, H];
+function wrapped(x, y, m, fn) {
+  for (const ox of OFF_X) for (const oy of OFF_Y) {
+    const X = x + ox, Y = y + oy;
+    if (X > -m && X < W + m && Y > -m && Y < H + m) fn(X, Y);
+  }
+}
+function fish(x, y, a, len, c, alpha, wig) {
+  push(); translate(x, y); rotate(a); noStroke(); fill(c[0], c[1], c[2], alpha);
+  push(); translate(-len * 0.38, 0); rotate(wig * 0.5);
+  triangle(0, 0, -len * 0.5, -len * 0.3, -len * 0.5, len * 0.3); pop();
+  ellipse(0, 0, len, len * 0.52);
+  fill(0, alpha); ellipse(len * 0.24, -len * 0.08, len * 0.13, len * 0.13);
+  pop();
+}
+const C_PREY = [60, 220, 210], C_HUNT = [255, 92, 98], C_AMBER = [255, 205, 90];
+
+function render(now, el) {
+  background(0);
+  drawArena(now);
+  drawHUD(now, el);
+  if (flash > 0) { noStroke(); fill(255, flash * 255); rect(0, 0, W, H); flash = Math.max(0, flash - dtMs / 1000 * 1.8); }
+}
+
+function drawArena(now) {
+  const cl = phase === 'montage' ? 0.5 : LV[L].clarity;
+  const dying = sim.dead;
+  // iz
+  const n = trail.length / 2;
+  if (n > 2) {
+    noFill(); strokeWeight(3);
+    for (let i = 1; i < n; i++) {
+      const x1 = trail[2 * i - 2], y1 = trail[2 * i - 1], x2 = trail[2 * i], y2 = trail[2 * i + 1];
+      if (Math.abs(x2 - x1) > W / 2 || Math.abs(y2 - y1) > H / 2) continue;
+      stroke(C_HUNT[0], C_HUNT[1], C_HUNT[2], 150 * (i / n) * (dying ? 0.3 : 1));
+      line(x1, y1, x2, y2);
+    }
+  }
+  // goruş cizgileri (ag "gorebildikce" belirginlesir)
+  if (!dying && cl > 0.2 && sim.ticks > 0) {
+    strokeWeight(1.2);
+    for (let k = 0; k < 3; k++) {
+      const i = sim.bi[k]; if (i < 0) continue;
+      let dx = sim.px[i] - sim.hx, dy = sim.py[i] - sim.hy;
+      if (dx > W / 2) dx -= W; else if (dx < -W / 2) dx += W;
+      if (dy > H / 2) dy -= H; else if (dy < -H / 2) dy += H;
+      stroke(C_PREY[0], C_PREY[1], C_PREY[2], cl * (k === 0 ? 170 : 55));
+      line(sim.hx, sim.hy, sim.hx + dx, sim.hy + dy);
+    }
+  }
+  // yemler
+  for (let i = 0; i < sim.n; i++) {
+    const wig = Math.sin(now * 0.012 + i * 1.7);
+    wrapped(sim.px[i], sim.py[i], 12, (X, Y) => fish(X, Y, sim.pa[i], 13, C_PREY, 235, wig));
+  }
+  // yeme halkalari
+  for (let i = rings.length - 1; i >= 0; i--) {
+    const r = rings[i], age = (now - r.t) / 650;
+    if (age > 1) { rings.splice(i, 1); continue; }
+    noFill(); strokeWeight(2); stroke(C_AMBER[0], C_AMBER[1], C_AMBER[2], 255 * (1 - age));
+    wrapped(r.x, r.y, 60, (X, Y) => circle(X, Y, 14 + 70 * age));
+  }
+  // avci
+  const ctx = drawingContext;
+  ctx.shadowBlur = dying ? 0 : 26; ctx.shadowColor = 'rgba(255,92,98,0.85)';
+  const wig = Math.sin(now * 0.02) * (0.4 + sim.speed * 0.25);
+  wrapped(sim.hx, sim.hy, 30, (X, Y) => fish(X, Y, sim.ha, 26, C_HUNT, dying ? 90 : 255, wig));
+  ctx.shadowBlur = 0;
+  // enerji cubugu
+  if (!dying) {
+    const e = Math.max(0, sim.energy);
+    wrapped(sim.hx, sim.hy, 30, (X, Y) => {
+      noStroke(); fill(255, 40); rect(X - 14, Y + 20, 28, 3, 2);
+      fill(e > 0.3 ? 255 : 255, e > 0.3 ? 255 : 92, e > 0.3 ? 255 : 98, 200); rect(X - 14, Y + 20, 28 * e, 3, 2);
+    });
+  }
+}
+
+function typed(s, t, cps) { return s.substring(0, Math.max(0, Math.floor(t * cps))); }
+function popK(t, d) { const x = Math.min(1, Math.max(0, t / d)); const c1 = 1.7, c3 = c1 + 1; return 1 + c3 * Math.pow(x - 1, 3) + c1 * Math.pow(x - 1, 2); }
+
+function drawHUD(now, el) {
+  const u = U, ctx = drawingContext;
+  let gr = ctx.createLinearGradient(0, 0, 0, 185 * u);
+  gr.addColorStop(0, 'rgba(0,0,0,0.55)'); gr.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = gr; ctx.fillRect(0, 0, W, 185 * u);
+  gr = ctx.createLinearGradient(0, H - 190 * u, 0, H);
+  gr.addColorStop(0, 'rgba(0,0,0,0)'); gr.addColorStop(1, 'rgba(0,0,0,0.6)');
+  ctx.fillStyle = gr; ctx.fillRect(0, H - 190 * u, W, 190 * u);
+
+  noStroke(); textAlign(CENTER, BASELINE);
+  const inMont = phase === 'montage';
+  const lv = LV[L];
+  let title, sub, gen;
+
+  if (inMont) {
+    title = 'evolving' + '...'.substring(0, 1 + Math.floor(now / 300) % 3);
+    sub = 'selection · crossover · mutation';
+    gen = Math.max(0, mShown);
+  } else {
+    title = `Level ${L + 1}/6 · ${lv.name}`;
+    gen = levelGen[L];
+    if (sim.dead) sub = DEATH[L];
+    else if (L === 5 && el < 2.6) sub = typed('...', el, 4);
+    else sub = typed(lv.sub, el - (L === 5 ? 2.6 : 0.35), 30);
+  }
+
+  // baslik
+  const k = inMont ? 1 : popK(el, 0.5);
+  fill(255, inMont ? 150 : 255 * Math.min(1, k + 0.2));
+  textStyle(BOLD); textSize((inMont ? 26 : 32 * (0.8 + 0.2 * k)) * u);
+  text(title, W / 2, 62 * u);
+  textStyle(NORMAL); textSize(16 * u); fill(255, 150);
+  text(sub, W / 2, 92 * u);
+
+  // fitness grafigi + sayaclar
+  drawGraph(34 * u, 120 * u, 300 * u, 46 * u, gen);
+  textAlign(RIGHT, BASELINE);
+  fill(255); textSize(24 * u); textStyle(BOLD); text('GEN ' + nf(gen, 3), W - 34 * u, 146 * u);
+  textStyle(NORMAL); textSize(14 * u); fill(C_AMBER[0], C_AMBER[1], C_AMBER[2], 230);
+  text('ate ' + nf(sim.eaten, 2), W - 34 * u, 168 * u);
+  textAlign(CENTER, BASELINE);
+
+  // sinir agi paneli
+  const cl = inMont ? 0.55 : lv.clarity;
+  drawNet(44 * u, H - 150 * u, W - 88 * u, 84 * u, cl);
+  fill(255, 90); textSize(12 * u);
+  text(`${CFG.pop} brains training in the background · ${Core.genomeSize(CFG)} weights`, W / 2, H - 30 * u);
+
+  // time-lapse sayaci
+  if (inMont) {
+    fill(255, 235); textStyle(BOLD); textSize(78 * u);
+    text('GEN ' + nf(gen, 3), W / 2, H * 0.5);
+    textStyle(NORMAL); textSize(16 * u); fill(C_AMBER[0], C_AMBER[1], C_AMBER[2], 140 + 110 * Math.abs(Math.sin(now / 160)));
+    text('>> fast forward >>', W / 2, H * 0.5 + 34 * u);
+  }
+
+  // aha!
+  if (phase === 'level' && L === 5 && el > 2.6 && el < 4.2) {
+    const t = el - 2.6, a = 255 * (1 - Math.max(0, (t - 1.0) / 0.6));
+    fill(C_AMBER[0], C_AMBER[1], C_AMBER[2], a); textStyle(BOLD);
+    textSize(104 * u * (0.7 + 0.3 * popK(t, 0.35)));
+    text('AHA.', W / 2, H * 0.47); textStyle(NORMAL);
+  }
+
+  // final karti
+  if (phase === 'end') {
+    const t = Math.min(1, el / 0.8);
+    noStroke(); fill(0, 175 * t); rect(0, 0, W, H);
+    fill(255, 255 * t); textStyle(BOLD); textSize(58 * u); text(Core.genomeSize(CFG) + ' numbers.', W / 2, H * 0.46);
+    textStyle(NORMAL); fill(255, 190 * t); textSize(20 * u); text("that's the whole brain.", W / 2, H * 0.46 + 38 * u);
+    fill(C_HUNT[0], C_HUNT[1], C_HUNT[2], 230 * t); textSize(13 * u);
+    text(`gen ${levelGen[5]} · pop ${CFG.pop} · 0 humans involved`, W / 2, H * 0.46 + 76 * u);
+  }
+}
+
+function drawGraph(x, y, w, h, upto) {
+  noFill(); strokeWeight(1); stroke(255, 40); line(x, y + h, x + w, y + h);
+  let mx = 60;
+  for (let g = 0; g <= latest; g++) if (hist[g] && hist[g].best > mx) mx = hist[g].best;
+  const X = g => x + g / MAXGEN * w, Y = f => y + h - Math.min(1, f / mx) * h;
+  const last = Math.min(upto, latest);
+  strokeWeight(1.5); stroke(255, 70); beginShape();
+  for (let g = 0; g <= last; g++) vertex(X(g), Y(hist[g].avg));
+  endShape();
+  strokeWeight(2.2); stroke(C_HUNT[0], C_HUNT[1], C_HUNT[2], 255); beginShape();
+  for (let g = 0; g <= last; g++) vertex(X(g), Y(hist[g].best));
+  endShape();
+  if (hist[last]) { noStroke(); fill(255); circle(X(last), Y(hist[last].best), 6 * U); }
+}
+
+function drawNet(x0, y0, w, h, cl) {
+  const nIn = sim.nIn, nH = sim.c.nHid, g = sim.g, inp = sim.inp, hid = sim.hid, out = sim.out;
+  const px = [x0, x0 + w / 2, x0 + w];
+  const ny = (n, i) => y0 + (i + 0.5) * h / n;
+  strokeWeight(1);
+  const edge = (xa, ya, xb, yb, wgt, act) => {
+    const a = (10 + 170 * Math.min(1, Math.abs(wgt * act) * 0.9)) * cl;
+    if (wgt > 0) stroke(255, 160, 60, a); else stroke(80, 160, 255, a);
+    line(xa, ya, xb, yb);
+  };
+  for (let hI = 0; hI < nH; hI++) for (let i = 0; i < nIn; i++)
+    edge(px[0], ny(nIn, i), px[1], ny(nH, hI), g[hI * (nIn + 1) + 1 + i], inp[i]);
+  const base = nH * (nIn + 1);
+  for (let o = 0; o < 2; o++) for (let hI = 0; hI < nH; hI++)
+    edge(px[1], ny(nH, hI), px[2], ny(2, o), g[base + o * (nH + 1) + 1 + hI], hid[hI]);
+  const node = (x, y, act, c) => {
+    stroke(255, 60 + 60 * cl); strokeWeight(1);
+    fill(c[0], c[1], c[2], 18 + 237 * Math.min(1, Math.abs(act)) * cl);
+    circle(x, y, 8.5 * U);
+  };
+  for (let i = 0; i < nIn; i++) node(px[0], ny(nIn, i), inp[i], C_PREY);
+  for (let hI = 0; hI < nH; hI++) node(px[1], ny(nH, hI), hid[hI], [255, 255, 255]);
+  for (let o = 0; o < 2; o++) node(px[2], ny(2, o), out[o], C_HUNT);
+  noStroke(); fill(255, 80); textSize(11 * U); textAlign(CENTER, BASELINE);
+  text('eyes', px[0], y0 + h + 16 * U); text('brain', px[1], y0 + h + 16 * U); text('fins', px[2], y0 + h + 16 * U);
+}
+</script>
+</body>
+</html>
